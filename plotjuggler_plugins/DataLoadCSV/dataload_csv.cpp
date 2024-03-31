@@ -11,8 +11,12 @@
 #include <QSyntaxStyle>
 #include <array>
 #include "datetimehelp.h"
+#include <QElapsedTimer>
 
 #include <QStandardItemModel>
+
+#define _CSV_PERF_DEBUG
+// #undef _CSV_PERF_DEBUG
 
 static constexpr int TIME_INDEX_NOT_DEFINED = -2;
 static constexpr int TIME_INDEX_GENERATED = -1;
@@ -86,6 +90,93 @@ void SplitLine(const QString& line, QChar separator, QStringList& parts)
       parts.push_back(QString());
     }
   }
+}
+
+double ParseNumberTimestamp(QString str, const QString& format_string, bool& is_number) {
+  QString str_trimmed = str.trimmed();
+  double val = 0.0;
+  is_number = false;
+  // Support the case where the timestamp is in nanoseconds / microseconds
+  int64_t ts = str_trimmed.toLong(&is_number);
+  const int64_t first_ts = 1400000000;  // July 14, 2017
+  const int64_t last_ts = 2000000000;   // May 18, 2033
+  if (is_number)
+  {
+    // check if it is an absolute time in nanoseconds.
+    // convert to seconds if it is
+    if (ts > first_ts * 1e9 && ts < last_ts * 1e9)
+    {
+      val = double(ts) * 1e-9;
+    }
+    else if (ts > first_ts * 1e6 && ts < last_ts * 1e6)
+    {
+      // check if it is an absolute time in microseconds.
+      // convert to seconds if it is
+      val = double(ts) * 1e-6;
+    }
+    else
+    {
+      val = double(ts);
+    }
+  }
+  else
+  {
+    // Try a double value (seconds)
+    val = str_trimmed.toDouble(&is_number);
+  }
+
+  // handle numbers with comma instead of point as decimal separator
+  if (!is_number)
+  {
+    static QLocale locale_with_comma(QLocale::German);
+    val = locale_with_comma.toDouble(str_trimmed, &is_number);
+  }
+  return val;
+};
+
+double ParseFormatStrTimestamp(QString str, const QString& format_string, bool& is_number) {
+  QString str_trimmed = str.trimmed();
+  QDateTime ts = QDateTime::fromString(str_trimmed, format_string);
+
+  is_number = ts.isValid();
+  return ts.toMSecsSinceEpoch() / 1000.0;
+};
+
+double ParseISO8601Timestamp(QString str, const QString& format_string, bool& is_number) {
+  QString str_trimmed = str.trimmed();
+  QDateTime ts = QDateTime::fromString(str_trimmed, Qt::ISODateWithMs);
+
+  is_number = ts.isValid();
+  return ts.toMSecsSinceEpoch() / 1000.0;
+};
+
+double (*ParseTimestampFunc)(QString str, const QString& format_string, bool& is_number);
+
+double ParseTimestampFirstRun(QString str, const QString& format_string, bool& is_number) {
+  is_number = false;
+  double val = ParseNumberTimestamp(str, format_string, is_number);
+  if (is_number) {
+    ParseTimestampFunc = ParseNumberTimestamp;
+    qDebug() << "Using number timestamp";
+    return val;
+  }
+
+  if (!format_string.isEmpty()) {
+    val = ParseFormatStrTimestamp(str, format_string, is_number);
+    if (is_number) {
+      ParseTimestampFunc = ParseFormatStrTimestamp;
+      qDebug() << "Using formatstr timestamp";
+      return val;
+    }
+  }
+
+  val = ParseISO8601Timestamp(str, format_string, is_number);
+  if (is_number) {
+    ParseTimestampFunc = ParseISO8601Timestamp;
+    qDebug() << "Using iso timestamp";
+  }
+
+  return val;
 }
 
 DataLoadCSV::DataLoadCSV()
@@ -500,81 +591,15 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
 
   //-----------------
   double prev_time = std::numeric_limits<double>::lowest();
-  bool parse_date_format = _ui->checkBoxDateFormat->isChecked();
-  QString format_string = _ui->lineEditDateFormat->text();
-  bool parse_iso_8601 = _ui->radioIso8601Date->isChecked();
+  const bool parse_date_format = _ui->checkBoxDateFormat->isChecked();
+  const bool parse_iso_8601 = _ui->radioIso8601Date->isChecked();
+  const QString format_string = parse_iso_8601 ? "" : _ui->lineEditDateFormat->text();
 
-  auto ParseTimestamp = [&](QString str, bool& is_number) {
-    QString str_trimmed = str.trimmed();
-    double val = 0.0;
-    is_number = false;
-    // Support the case where the timestamp is in nanoseconds / microseconds
-    int64_t ts = str_trimmed.toLong(&is_number);
-    const int64_t first_ts = 1400000000;  // July 14, 2017
-    const int64_t last_ts = 2000000000;   // May 18, 2033
-    if (is_number)
-    {
-      // check if it is an absolute time in nanoseconds.
-      // convert to seconds if it is
-      if (ts > first_ts * 1e9 && ts < last_ts * 1e9)
-      {
-        val = double(ts) * 1e-9;
-      }
-      else if (ts > first_ts * 1e6 && ts < last_ts * 1e6)
-      {
-        // check if it is an absolute time in microseconds.
-        // convert to seconds if it is
-        val = double(ts) * 1e-6;
-      }
-      else
-      {
-        val = double(ts);
-      }
-    }
-    else
-    {
-      // Try a double value (seconds)
-      val = str_trimmed.toDouble(&is_number);
-    }
-
-    // handle numbers with comma instead of point as decimal separator
-    if (!is_number)
-    {
-      static QLocale locale_with_comma(QLocale::German);
-      val = locale_with_comma.toDouble(str_trimmed, &is_number);
-    }
-    if (!is_number && parse_date_format && (!format_string.isEmpty() || parse_iso_8601))
-    {
-      QDateTime ts = parse_iso_8601 ? QDateTime::fromString(str_trimmed, Qt::ISODateWithMs) : QDateTime::fromString(str_trimmed, format_string);
-      is_number = ts.isValid();
-      if (is_number)
-      {
-        val = ts.toMSecsSinceEpoch() / 1000.0;
-      }
-    }
-    return val;
+  auto ParseNumber = [](QString str, bool& is_number) {
+    return str.trimmed().toDouble(&is_number);
   };
 
-  auto ParseNumber = [&](QString str, bool& is_number) {
-    QString str_trimmed = str.trimmed();
-    double val = val = str_trimmed.toDouble(&is_number);
-    // handle numbers with comma instead of point as decimal separator
-    if (!is_number)
-    {
-      static QLocale locale_with_comma(QLocale::German);
-      val = locale_with_comma.toDouble(str_trimmed, &is_number);
-    }
-    if (!is_number && parse_date_format && (!format_string.isEmpty() || parse_iso_8601))
-    {
-      QDateTime ts = parse_iso_8601 ? QDateTime::fromString(str_trimmed, Qt::ISODateWithMs) : QDateTime::fromString(str_trimmed, format_string);
-      is_number = ts.isValid();
-      if (is_number)
-      {
-        val = ts.toMSecsSinceEpoch() / 1000.0;
-      }
-    }
-    return val;
-  };
+  ParseTimestampFunc = ParseTimestampFirstRun;
 
   file.open(QFile::ReadOnly);
   QTextStream in(&file);
@@ -587,6 +612,13 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
   QString time_header_str;
   QString t_str;
   QString prev_t_str;
+
+#ifdef _CSV_PERF_DEBUG
+  QElapsedTimer timer;
+  timer.start();
+  qint64 parseDateTime = 0;
+  qint64 parseNumberTime = 0;
+#endif
 
   while (!in.atEnd())
   {
@@ -637,12 +669,15 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
     }
 
     double timestamp = linecount;
+#ifdef _CSV_PERF_DEBUG
+    qint64 start_segment = timer.elapsed();
+#endif
 
     if (time_index >= 0)
     {
       bool is_number = false;
       t_str = string_items[time_index];
-      timestamp = ParseTimestamp(t_str, is_number);
+      timestamp = ParseTimestampFunc(t_str, format_string, is_number);
       time_header_str = header_string_items[time_index];
 
       if (!is_number)
@@ -722,6 +757,11 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
       prev_t_str = t_str;
     }
 
+#ifdef _CSV_PERF_DEBUG
+    parseDateTime += (timer.elapsed() - start_segment);
+    start_segment = timer.elapsed();
+#endif
+
     for (unsigned i = 0; i < string_items.size(); i++)
     {
       bool is_number = false;
@@ -736,6 +776,10 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
         string_vector[i]->pushBack({ timestamp, str.toStdString() });
       }
     }
+
+#ifdef _CSV_PERF_DEBUG
+    parseNumberTime += (timer.elapsed() - start_segment);
+#endif
 
     if (linecount++ % 100 == 0)
     {
@@ -783,6 +827,13 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
       plot_data.numeric.erase(plot_data.numeric.find(name));
     }
   }
+
+#ifdef _CSV_PERF_DEBUG
+  qDebug() << "      reading file took" << timer.elapsed() << "milliseconds";
+  qDebug() << "  of which date parsing" << parseDateTime << "milliseconds";
+  qDebug() << "of which number parsing" << parseNumberTime << "milliseconds";
+#endif
+
   return true;
 }
 
