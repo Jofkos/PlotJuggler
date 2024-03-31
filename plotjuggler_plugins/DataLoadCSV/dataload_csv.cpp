@@ -593,6 +593,7 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
   double prev_time = std::numeric_limits<double>::lowest();
   const bool parse_date_format = _ui->checkBoxDateFormat->isChecked();
   const bool parse_iso_8601 = _ui->radioIso8601Date->isChecked();
+  const bool skip_invalid_rows = _ui->checkBoxSkipInvalidRows->isChecked();
   const QString format_string = parse_iso_8601 ? "" : _ui->lineEditDateFormat->text();
 
   auto ParseNumber = [](QString str, bool& is_number) {
@@ -633,6 +634,9 @@ bool DataLoadCSV::readDataFromFile(FileLoadInfo* info, PlotDataMapRef& plot_data
 
     if (string_items.size() != column_names.size())
     {
+      if (skip_invalid_rows)
+        continue;
+
       QMessageBox msgBox;
       msgBox.setWindowTitle(tr("Error reading file"));
       msgBox.setText(tr("The number of values at line %1 is %2,\n"
@@ -852,6 +856,9 @@ bool DataLoadCSV::xmlSaveState(QDomDocument& doc, QDomElement& parent_element) c
   {
     elem.setAttribute("date_format_iso", "ISO8601");
   }
+  if (_ui->checkBoxSkipInvalidRows->isChecked()) {
+    elem.setAttribute("skip_invalid_rows", "true");
+  }
 
   parent_element.appendChild(elem);
   return true;
@@ -895,6 +902,9 @@ bool DataLoadCSV::xmlLoadState(const QDomElement& parent_element)
     _ui->radioIso8601Date->setChecked(true);
   } else {
     _ui->radioCustomDate->setChecked(true);
+  }
+  if (elem.hasAttribute("skip_invalid_rows")) {
+    _ui->checkBoxSkipInvalidRows->setChecked(true);
   }
   return true;
 }
